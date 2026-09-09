@@ -8,20 +8,14 @@ import (
 	_ "fmt"
 	"log"
 	"log/slog"
-	"strconv"
-	"sync"
 
 	_ "github.com/whosonfirst/go-whosonfirst/v4/spatial/pmtiles"
 
-	"github.com/paulmach/orb/planar"
 	"github.com/sfomuseum/go-parquet"
 	"github.com/whosonfirst/go-openpois"
+	"github.com/whosonfirst/go-openpois/whosonfirst"
 	"github.com/whosonfirst/go-reader/v2"
-	"github.com/whosonfirst/go-whosonfirst/v4/feature/properties"
-	wof_reader "github.com/whosonfirst/go-whosonfirst/v4/reader"
 	"github.com/whosonfirst/go-whosonfirst/v4/spatial/database"
-	"github.com/whosonfirst/go-whosonfirst/v4/spatial/filter"
-	"github.com/whosonfirst/go-whosonfirst/v4/spatial/hierarchy"
 )
 
 func main() {
@@ -30,13 +24,20 @@ func main() {
 	var spatial_database_uri string
 	var target_uri string
 	var refresh bool
+	var verbose bool
 
-	flag.StringVar(&reader_uri, "reader-uri", "https://data.whosonfirst.org", "")
-	flag.StringVar(&spatial_database_uri, "spatial-database-uri", "pmtiles://?tiles=file:///usr/local/data/whosonfirst/whosonfirst-pmtiles&database=whosonfirst-point-in-polygon-z13-20250805&enable-cache=true&zoom=13&layer=whosonfirst", "")
-	flag.StringVar(&target_uri, "target-uri", "", "")
-	flag.BoolVar(&refresh, "refresh", false, "")
+	flag.StringVar(&reader_uri, "reader-uri", "https://data.whosonfirst.org", "A registered whosonfirst/go-reader/v2.Reader URI.")
+	flag.StringVar(&spatial_database_uri, "spatial-database-uri", "pmtiles://?tiles=file:///usr/local/data/whosonfirst/whosonfirst-pmtiles&database=whosonfirst-point-in-polygon-z13-20250805&enable-cache=true&zoom=13&layer=whosonfirst", "A registered whosonfirst/go-whosonfirst/v4/spatial/database.SpatialDatabase URI.")
+	flag.StringVar(&target_uri, "target-uri", "-", "The URI where data should be written to. Default is STDOUT (-).")
+	flag.BoolVar(&refresh, "refresh", false, "Update records with existing Who's On First properties.")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose (debug) logging.")
 
 	flag.Parse()
+
+	if verbose {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+		slog.Debug("Verbose logging enabled")
+	}
 
 	ctx := context.Background()
 	uris := flag.Args()
@@ -55,23 +56,10 @@ func main() {
 
 	defer spatial_db.Close(ctx)
 
-	resolver_opts := &hierarchy.PointInPolygonHierarchyResolverOptions{
+	append_opts := &whosonfirst.AppendWhosOnFirstPropertiesOptions{
 		Database: spatial_db,
+		Reader:   wof_r,
 	}
-
-	resolver, err := hierarchy.NewPointInPolygonHierarchyResolver(ctx, resolver_opts)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	inputs := &filter.SPRInputs{
-		IsCurrent: []int64{
-			1,
-		},
-	}
-
-	parent_cache := new(sync.Map)
 
 	p_wr, err := parquet.NewWriter[*openpois.Record](ctx, target_uri)
 
@@ -89,83 +77,19 @@ func main() {
 		logger = logger.With("id", rec.UnifiedID)
 		logger = logger.With("name", rec.PrimaryName())
 
-		if rec.WhosOnFirstParentId != -1 && !refresh {
+		if rec.WhosOnFirstParentId != 0 && !refresh {
 			p_wr.WriteRow(rec)
 			continue
 		}
 
-		// logger.Info("Fetch WOF data")
-
-		geom, err := rec.ToOrbGeometry()
+		err = whosonfirst.AppendWhosOnFirstProperties(ctx, rec, append_opts)
 
 		if err != nil {
-			logger.Warn("Failed to derive geometry", "error", err)
-			p_wr.WriteRow(rec)
-			continue
-		}
-
-		pt, _ := planar.CentroidArea(geom)
-
-		logger = logger.With("centroid", pt)
-
-		rsp, err := resolver.PointInPolygonWithPoint(ctx, inputs, &pt, "venue")
-
-		if err != nil {
-			logger.Error("Failed to point-in-polygon", "error", err)
-			p_wr.WriteRow(rec)
-			continue
-		}
-
-		switch len(rsp) {
-		case 0:
-			rec.WhosOnFirstParentId = -1
-			rec.WhosOnFirstCountry = "XY"
-		case 1:
-
-			spr := rsp[0]
-
-			parent_id, err := strconv.ParseInt(spr.Id(), 10, 64)
-
-			if err != nil {
-				logger.Error("Failed to parse parent ID", "parent id", spr.Id(), "error", err)
-			} else {
-				rec.WhosOnFirstParentId = parent_id
-			}
-
-			logger = logger.With("parent id", parent_id)
-
-			v, ok := parent_cache.Load(parent_id)
-
-			if ok {
-				parent_body := v.([]byte)
-				rec.WhosOnFirstHierarchies = properties.Hierarchies(parent_body)
-				rec.WhosOnFirstCountry = properties.Country(parent_body)
-			} else {
-
-				parent_body, err := wof_reader.LoadBytes(ctx, wof_r, parent_id)
-
-				if err != nil {
-					logger.Error("Failed to retrieve parent body", "error", err)
-				} else {
-					parent_cache.Store(parent_id, parent_body)
-
-					rec.WhosOnFirstHierarchies = properties.Hierarchies(parent_body)
-					rec.WhosOnFirstCountry = properties.Country(parent_body)
-				}
-			}
-
-			// slog.Info("Hiers", "h", rec.WhosOnFirstHierarchies)
-		default:
-
-			rec.WhosOnFirstParentId = -1
-			rec.WhosOnFirstCountry = "XY"
-
-			for i, r := range rsp {
-				logger.Info("Multiple hierarchies", "i", i, "r", r.Id(), "n", r.Name(), "p", r.Placetype())
-			}
+			logger.Warn("Failed to append Who's On First properties", "error", err)
 		}
 
 		p_wr.WriteRow(rec)
+		logger.Info("Write row", "parent", rec.WhosOnFirstParentId, "country", rec.WhosOnFirstCountry)
 	}
 
 	slog.Info("Close parquet writer")

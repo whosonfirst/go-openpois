@@ -3,3 +3,4 @@ go.work*
 work
 bin
 main
+*.parquet
